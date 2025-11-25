@@ -1,72 +1,79 @@
 import streamlit as st
 import pandas as pd
-import time
-import traceback
-
-# IMPORT YOUR FULL SCANNER LOGIC
 from advanced_readiness_scanner_mtf_btd import (
-    get_history,
-    compute_technical_metrics_from_hist,
-    compute_options_metrics,
-    detect_asset_class,
-    detect_sector,
-    score_price_momentum_from_tech,
-    score_volume_flow_from_tech_opt,
-    score_fundamentals,
-    institutional_flow_proxy,
-    get_buy_signal_from_score
+    TOP_LEVEL_TICKERS,
+    run_full_scan  # you create this wrapper to run your logic per ticker
 )
 
 st.set_page_config(page_title="Readiness Scanner", layout="wide")
 
-st.title("📊 Advanced Readiness Scanner (Multi-TF + BTD)")
+st.title("📊 Advanced Readiness Scanner (MTF + BTD)")
+st.write("Run analysis on a single ticker or scan all tickers in your list.")
 
-ticker = st.text_input("Enter Ticker (e.g., AAPL, TSLA, SPY)", value="AAPL")
+# -------------------------------------------------------------------
+# UI INPUTS
+# -------------------------------------------------------------------
+st.subheader("Single Ticker Scan")
+single_ticker = st.text_input("Enter Ticker (e.g., AAPL, TSLA, BTC-USD, EURUSD=X)")
 
-run_button = st.button("Run Scanner")
+run_single = st.button("Run Single Ticker Scan")
 
-if run_button:
-    try:
-        st.write("Fetching data… this may take a few seconds...")
+st.divider()
 
-        # Multi-timeframe data
-        results = {}
-        for tf in ["1d", "4h", "1h"]:
-            hist = get_history(ticker, timeframe=tf)
-            tech = compute_technical_metrics_from_hist(hist)
-            opt = compute_options_metrics(ticker)
+st.subheader("Bulk Scan")
+run_bulk = st.button("Run Full Bulk Scan (All Tickers)")
 
-            price_score = score_price_momentum_from_tech(tech)
-            flow_score = score_volume_flow_from_tech_opt(tech, opt, detect_asset_class(ticker))
-            fund_score = score_fundamentals(ticker)
-            inst_score = institutional_flow_proxy(tech, opt)
+# -------------------------------------------------------------------
+# RUN SINGLE TICKER
+# -------------------------------------------------------------------
+if run_single:
+    if not single_ticker.strip():
+        st.error("Please enter a ticker.")
+    else:
+        with st.spinner(f"Running scan for {single_ticker}..."):
+            try:
+                result = run_full_scan(single_ticker.upper())
 
-            total = (
-                price_score * 0.5 +
-                flow_score * 0.3 +
-                fund_score * 0.2 +
-                inst_score * 0.1
-            )
+                if isinstance(result, pd.DataFrame):
+                    st.success(f"Scan complete for {single_ticker}")
+                    st.dataframe(result, use_container_width=True)
+                else:
+                    st.json(result)
 
-            results[tf] = {
-                "Price Score": price_score,
-                "Flow Score": flow_score,
-                "Fundamentals": fund_score,
-                "Inst. Flow": inst_score,
-                "Total Score": total,
-                "Signal": get_buy_signal_from_score(total)
-            }
+            except Exception as e:
+                st.error(f"Error: {e}")
 
-        st.success("Scan Complete!")
+# -------------------------------------------------------------------
+# RUN BULK SCAN
+# -------------------------------------------------------------------
+if run_bulk:
+    if not TOP_LEVEL_TICKERS:
+        st.error("Your TOP_LEVEL_TICKERS list is empty.")
+    else:
+        st.info(f"Scanning {len(TOP_LEVEL_TICKERS)} tickers...")
+        all_results = []
 
-        df = pd.DataFrame(results).T
-        st.dataframe(df)
+        progress = st.progress(0)
+        for i, t in enumerate(TOP_LEVEL_TICKERS):
+            progress.progress((i+1)/len(TOP_LEVEL_TICKERS))
+            try:
+                data = run_full_scan(t)
+                if isinstance(data, dict):
+                    all_results.append(data)
+                elif isinstance(data, pd.DataFrame):
+                    all_results.append(data.to_dict(orient="records")[0])
+            except Exception as e:
+                all_results.append({"Ticker": t, "Error": str(e)})
 
-        # Final decision
-        final_signal = df["Total Score"].mean()
-        st.header("Final Signal")
-        st.subheader(f"📌 {get_buy_signal_from_score(final_signal)} ({final_signal:.2f})")
+        df = pd.DataFrame(all_results)
+        st.success("Bulk scan complete!")
+        st.dataframe(df, use_container_width=True)
 
-    except Exception as e:
-        st.error("Error occurred:")
-        st.code(traceback.format_exc())
+        # Option to download results
+        csv = df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download Results (CSV)",
+            csv,
+            "readiness_bulk_results.csv",
+            "text/csv"
+        )
