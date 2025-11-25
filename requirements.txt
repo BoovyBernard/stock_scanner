@@ -1,10 +1,8 @@
-os
-math
-time
-yfinance as yf
+streamlit
+yfinance
 pandas
 numpy
 requests
-BeautifulSoup
-datetime, timedelta
-warnings
+beautifulsoup4
+lxml
+openpyxl
