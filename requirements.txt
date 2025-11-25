@@ -5,6 +5,6 @@ yfinance
 pandas
 numpy
 requests
-from bs4 import BeautifulSoup
-from datetime import datetime, timedelta
+BeautifulSoup
+datetime, timedelta
 warnings
