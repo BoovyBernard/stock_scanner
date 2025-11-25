@@ -751,4 +751,74 @@ if __name__ == "__main__":
     else:
         print("No scores computed.")
 
+---------------------------
+
+def run_full_scan(ticker):
+    """
+    Wrapper to run your entire scoring process for ONE ticker.
+    Returns dict or pandas.DataFrame so Streamlit can display it.
+    """
+    try:
+        # -------------------------
+        # 1. Detect class & sector
+        # -------------------------
+        asset_class = detect_asset_class(ticker)
+        sector = detect_sector(ticker, asset_class)
+
+        # 2. Multi-timeframe technicals
+        mtf_results = {}
+        mtf_scores = []
+        for tf in MTF_TIMEFRAMES:
+            hist = get_history(ticker, timeframe=tf)
+            tech = compute_technical_metrics_from_hist(hist)
+            p_score = score_price_momentum_from_tech(tech)
+            mtf_results[tf] = p_score
+            if p_score >= MTF_POSITIVE_PRICE_SCORE:
+                mtf_scores.append(1)
+
+        mtf_confirmation = len(mtf_scores)
+
+        # 3. Options
+        opt = compute_options_metrics(ticker)
+
+        # 4. Fundamentals
+        fund_score = score_fundamentals(ticker)
+
+        # 5. Volume/Flow
+        flow_score = score_volume_flow_from_tech_opt(tech, opt, asset_class)
+
+        # 6. Institutional proxy
+        inst_score = institutional_flow_proxy(tech, opt)
+
+        # 7. Final Weighted Score
+        cfg = SCORES_CONFIG.get(asset_class, SCORES_CONFIG["UNKNOWN"])
+        final_score = (
+            cfg["price"] * p_score +
+            cfg["flow"] * flow_score +
+            cfg["fund"] * fund_score +
+            INST_FLOW_WEIGHT * inst_score
+        )
+
+        signal = get_buy_signal_from_score(final_score)
+
+        # record history
+        append_history_row(ticker, final_score, signal)
+
+        # return dict to streamlit
+        return {
+            "Ticker": ticker,
+            "AssetClass": asset_class,
+            "Sector": sector,
+            "FinalScore": round(final_score, 2),
+            "Signal": signal,
+            "MTF_Confirmation": mtf_confirmation,
+            "RSI": tech.get("rsi"),
+            "OBV_Slope_Pos": tech.get("obv_slope_pos"),
+            "Call/Put Vol Ratio": opt.get("call_put_vol_ratio"),
+            "Call/Put OI Ratio": opt.get("call_put_oi_ratio"),
+        }
+
+    except Exception as e:
+        return {"Ticker": ticker, "Error": str(e)}
+
 
