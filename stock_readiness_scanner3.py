@@ -15,7 +15,6 @@ Features:
 import os
 import math
 import time
-os.makedirs(os.path.expanduser('~/.cache'), exist_ok=True)  # Creates cache dir
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -751,4 +750,5 @@ if __name__ == "__main__":
         print(df[cols].head(20).to_string(index=False))
     else:
         print("No scores computed.")
+
 
