@@ -439,12 +439,16 @@ if mode == "Manual tickers":
     raw = st.sidebar.text_area("Tickers (comma separated)", value="AAPL, NVDA, MSFT, TSLA")
     tickers = [t.strip().upper() for t in raw.split(",") if t.strip()]
 else:
-    grp = st.sidebar.selectbox("Group", ["DOW30","NASDAQ_SAMPLE","CRYPTO_SAMPLE","FOREX_SAMPLE"])
+    grp = st.sidebar.selectbox("Group", ["DOW30","NASDAQ","CRYPTO","FOREX","US100","US500","SECTORS","EFTS"])
     GROUPS = {
         "DOW30": ["AAPL","MSFT","JPM","GS","CVX","CAT","MMM","V","DIS","KO","WMT"],
-        "NASDAQ_SAMPLE": ["AAPL","MSFT","NVDA","TSLA","AMZN","META","ADBE"],
-        "CRYPTO_SAMPLE": ["BTC-USD","ETH-USD","SOL-USD","ADA-USD"],
-        "FOREX_SAMPLE": ["EURUSD=X","GBPUSD=X","USDJPY=X","USDCAD=X"]
+        "NASDAQ": ["AAPL","MSFT","NVDA","TSLA","AMZN","META","ADBE"],
+        "CRYPTO": ["BTC-USD","ETH-USD","SOL-USD","ADA-USD"],
+        "FOREX": ["EURUSD=X","GBPUSD=X","USDJPY=X","USDCAD=X"],
+        "US100": [],
+        "US500": [],
+        "SECTORS": [],
+        "EFTS": [],
     }
     tickers = GROUPS.get(grp, [])
 
