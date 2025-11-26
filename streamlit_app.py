@@ -1,14 +1,10 @@
 # streamlit_app.py
 """
-Advanced Readiness Scanner — single-file Streamlit app
-Features:
- - Defensive scanner (yfinance)
- - Multi-timeframe scoring (1d, 4h, 1h)
- - Candlestick + RSI + OBV charts
- - Rule-based "AI" commentary for each ticker
- - SQLite history storage and trend gauge + history charts
- - Download CSV export
+Advanced Readiness Scanner — Bloomberg-style UI + in-app scheduled scans
+Single-file app: defensive scanning, MTF, charts, rule-based commentary, SQLite history,
+Bloomberg-like dark theme, metric cards and scheduled scans (runs while page is open).
 """
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -16,16 +12,16 @@ import yfinance as yf
 import plotly.graph_objects as go
 import plotly.express as px
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 import sqlite3
+import time
 import os
-import math
 import warnings
 warnings.filterwarnings("ignore")
 
-# ----------------------------
-# Configuration
-# ----------------------------
+# -------------------------
+# Configuration (tweakable)
+# -------------------------
 HIST_DAYS = 180
 EMA_FAST = 9
 EMA_SLOW = 21
@@ -36,18 +32,14 @@ MTF_TIMEFRAMES = ["1d", "4h", "1h"]
 MTF_POSITIVE_PRICE_SCORE = 60
 MTF_CONFIRM_THRESHOLD = 2
 INST_FLOW_WEIGHT = 0.35
-
 DB_PATH = "scanner_history.db"
 MAX_WORKERS = 8
 
-# Score config (kept simple)
-SCORES_CONFIG = {
-    "STOCK": {"price": 0.45, "flow": 0.35, "fund": 0.20},
-}
+SCORES_CONFIG = {"STOCK": {"price": 0.45, "flow": 0.35, "fund": 0.20}}
 
-# ----------------------------
-# Utilities: SQLite history
-# ----------------------------
+# -------------------------
+# Utility: DB
+# -------------------------
 def init_db(db_path=DB_PATH):
     conn = sqlite3.connect(db_path, check_same_thread=False)
     cur = conn.cursor()
@@ -66,14 +58,17 @@ def init_db(db_path=DB_PATH):
 
 DB_CONN = init_db()
 
-def persist_scan(ticker, score, signal, price, conn=DB_CONN):
-    cur = conn.cursor()
-    cur.execute("INSERT INTO scans (ts,ticker,score,signal,price) VALUES (?,?,?,?,?)",
-                (datetime.utcnow().isoformat(), ticker, float(score) if score is not None else None, str(signal), float(price) if price is not None else None))
-    conn.commit()
+def persist_scan(ticker, score, signal, price):
+    try:
+        cur = DB_CONN.cursor()
+        cur.execute("INSERT INTO scans (ts,ticker,score,signal,price) VALUES (?,?,?,?,?)",
+                    (datetime.utcnow().isoformat(), ticker, float(score) if score is not None else None, str(signal), float(price) if price is not None else None))
+        DB_CONN.commit()
+    except Exception:
+        pass
 
-def read_history(ticker=None, limit=200, conn=DB_CONN):
-    cur = conn.cursor()
+def read_history(ticker=None, limit=200):
+    cur = DB_CONN.cursor()
     if ticker:
         cur.execute("SELECT ts,ticker,score,signal,price FROM scans WHERE ticker=? ORDER BY id DESC LIMIT ?", (ticker, limit))
     else:
@@ -82,18 +77,18 @@ def read_history(ticker=None, limit=200, conn=DB_CONN):
     df = pd.DataFrame(rows, columns=["ts","ticker","score","signal","price"])
     return df
 
-# ----------------------------
-# Safe wrappers around yfinance
-# ----------------------------
-def safe_ticker(t):
+# -------------------------
+# YFinance safe helpers
+# -------------------------
+def safe_ticker(sym):
     try:
-        return yf.Ticker(t)
+        return yf.Ticker(sym)
     except Exception:
         return None
 
-def safe_history(ticker, interval, period):
+def safe_history(sym, interval, period):
     try:
-        t = safe_ticker(ticker)
+        t = safe_ticker(sym)
         if t is None:
             return pd.DataFrame()
         df = t.history(period=period, interval=interval, actions=False)
@@ -103,11 +98,11 @@ def safe_history(ticker, interval, period):
     except Exception:
         return pd.DataFrame()
 
-# ----------------------------
-# Indicator helpers
-# ----------------------------
-def ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
+# -------------------------
+# Indicators
+# -------------------------
+def ema(series, span):
+    return series.ewm(span=span, adjust=False).mean()
 
 def rsi(series, period=RSI_PERIOD):
     delta = series.diff()
@@ -118,46 +113,39 @@ def rsi(series, period=RSI_PERIOD):
     rs = ma_up / ma_down
     return 100 - (100 / (1 + rs))
 
-def obv(series, volume):
-    if series.empty:
+def obv(close, volume):
+    if close.empty:
         return pd.Series(dtype=float)
-    obv_values = [0]
-    for i in range(1, len(series)):
-        if series.iat[i] > series.iat[i-1]:
-            obv_values.append(obv_values[-1] + (0 if volume.isna().iat[i] else volume.iat[i]))
-        elif series.iat[i] < series.iat[i-1]:
-            obv_values.append(obv_values[-1] - (0 if volume.isna().iat[i] else volume.iat[i]))
-        else:
-            obv_values.append(obv_values[-1])
-    return pd.Series(obv_values, index=series.index)
+    out = [0]
+    for i in range(1, len(close)):
+        try:
+            if close.iat[i] > close.iat[i-1]:
+                out.append(out[-1] + (0 if pd.isna(volume.iat[i]) else volume.iat[i]))
+            elif close.iat[i] < close.iat[i-1]:
+                out.append(out[-1] - (0 if pd.isna(volume.iat[i]) else volume.iat[i]))
+            else:
+                out.append(out[-1])
+        except:
+            out.append(out[-1])
+    return pd.Series(out, index=close.index)
 
 def safe_div(a,b):
     try:
-        if b == 0 or pd.isna(b):
-            return np.nan
-        return a/b
+        if b == 0 or pd.isna(b): return np.nan
+        return a / b
     except:
         return np.nan
 
-# ----------------------------
-# Defensive technical metrics
-# ----------------------------
+# -------------------------
+# Defensive metrics
+# -------------------------
 def compute_technical_metrics(hist):
     tech = {
-        "last_close": np.nan,
-        "ema_fast": np.nan,
-        "ema_slow": np.nan,
-        "ema_cross": 0,
-        "price_above_ema_slow": 0,
-        "rsi": np.nan,
-        "rsi_rising": 0,
-        "higher_lows_3": 0,
-        "obv_latest": np.nan,
-        "obv_slope": 0.0,
-        "obv_slope_pos": 0,
-        "avg_vol_30": 0.0,
-        "today_vol": 0.0,
-        "vol_spike_up": 0
+        "last_close": np.nan, "ema_fast": np.nan, "ema_slow": np.nan,
+        "ema_cross": 0, "price_above_ema_slow": 0, "rsi": np.nan,
+        "rsi_rising": 0, "higher_lows_3": 0, "obv_latest": np.nan,
+        "obv_slope": 0.0, "obv_slope_pos": 0, "avg_vol_30": 0.0,
+        "today_vol": 0.0, "vol_spike_up": 0
     }
     if hist.empty or "Close" not in hist.columns:
         return tech
@@ -175,7 +163,7 @@ def compute_technical_metrics(hist):
     try:
         r = rsi(close)
         tech["rsi"] = float(r.iloc[-1])
-        tech["rsi_rising"] = int(r.iloc[-1] > r.iloc[-3]) if len(r) >= 3 else 0
+        tech["rsi_rising"] = int(r.iloc[-1] > r.iloc[-3]) if len(r)>=3 else 0
     except:
         pass
     try:
@@ -205,9 +193,9 @@ def compute_technical_metrics(hist):
         pass
     return tech
 
-# ----------------------------
-# Options metrics (defensive)
-# ----------------------------
+# -------------------------
+# Options (defensive)
+# -------------------------
 def compute_options_metrics(ticker):
     out = {"opt_expiry": None, "call_put_vol_ratio": np.nan, "call_put_oi_ratio": np.nan}
     try:
@@ -239,9 +227,9 @@ def compute_options_metrics(ticker):
         pass
     return out
 
-# ----------------------------
-# Scoring helpers
-# ----------------------------
+# -------------------------
+# Scoring
+# -------------------------
 def score_price_momentum(tech):
     score = 0.0
     try:
@@ -281,20 +269,16 @@ def inst_flow_proxy(tech, opt):
     return float(score)
 
 def get_buy_signal(score):
-    if score >= 82:
-        return "STRONG BUY"
-    if score >= 74:
-        return "BUY"
-    if score >= 66:
-        return "WATCHLIST"
+    if score >= 82: return "STRONG BUY"
+    if score >= 74: return "BUY"
+    if score >= 66: return "WATCHLIST"
     return "NO TRADE"
 
-# ----------------------------
-# Buy-the-dip simple detector
-# ----------------------------
+# -------------------------
+# Buy-the-dip
+# -------------------------
 def detect_buy_the_dip(hist):
-    if hist.empty:
-        return False, np.nan, np.nan
+    if hist.empty: return False, np.nan, np.nan
     try:
         look = hist["Close"].iloc[-20:]
         recent_high = float(look.max())
@@ -305,9 +289,9 @@ def detect_buy_the_dip(hist):
     except:
         return False, np.nan, np.nan
 
-# ----------------------------
-# MTF confirmation
-# ----------------------------
+# -------------------------
+# MTF
+# -------------------------
 def compute_mtf_scores(ticker):
     details = {}
     positives = 0
@@ -322,91 +306,60 @@ def compute_mtf_scores(ticker):
     confirmed = positives >= MTF_CONFIRM_THRESHOLD
     return positives, confirmed, details
 
-# ----------------------------
-# Rule-based AI commentary (deterministic)
-# ----------------------------
-def ai_commentary(result):
-    # result contains keys like final, price_score, flow_score, inst_flow, btd, mtf_details
-    score = result.get("final_score", None)
+# -------------------------
+# Rule-based commentary
+# -------------------------
+def ai_commentary(d):
+    score = d.get("final_score")
     parts = []
     if score is None:
-        return "No score available to generate commentary."
-    # High-level sentiment
+        return "No score available."
     if score >= 82:
-        parts.append("Strong conviction — multiple indicators aligned.")
+        parts.append("Strong conviction — multiple timeframe alignment.")
     elif score >= 74:
-        parts.append("Positive bias — favorable technicals, verify multi-timeframe confirmation.")
+        parts.append("Positive bias — watch for confirmation.")
     elif score >= 66:
-        parts.append("Neutral-to-positive — worth watchlist monitoring; wait for confirmation.")
+        parts.append("Neutral; on the watchlist.")
     else:
-        parts.append("Not a trade currently — consider waiting for clearer setups.")
-
-    # Explain price subscore
-    ps = result.get("price_score", 0)
-    if ps >= 60:
-        parts.append("Price momentum is positive (EMA cross / higher lows / rising RSI).")
+        parts.append("No trade recommended.")
+    if d.get("price_score",0) >= 60:
+        parts.append("Price momentum is favorable.")
     else:
-        parts.append("Price momentum is weak or neutral.")
-
-    # Explain flow
-    fs = result.get("flow_score", 0)
-    if fs >= 50:
-        parts.append("Options/volume flow supports direction (notable call activity or volume spikes).")
+        parts.append("Price momentum is weak.")
+    if d.get("flow_score",0) >= 50:
+        parts.append("Flow signals supportive.")
     else:
-        parts.append("Flow signals are weak or neutral.")
-
-    # MTF
-    mtf = result.get("mtf_details", {})
-    if isinstance(mtf, dict):
-        pos = sum(1 for v in mtf.values() if isinstance(v, (int,float)) and v >= MTF_POSITIVE_PRICE_SCORE)
-        parts.append(f"Multi-timeframe positive count: {pos} (threshold {MTF_CONFIRM_THRESHOLD}).")
-
-    # BTD
-    if result.get("btd", False):
-        parts.append(f"Buy-the-dip detected (pullback {result.get('btd_pullback','N/A')}%). This can be a lower-risk entry if trend holds.")
-
-    # Final actionable hint
-    if score >= 74 and pos >= MTF_CONFIRM_THRESHOLD:
-        parts.append("Action: Consider size/entries aligned with risk plan (confirm with volume & option flow).")
-    elif score >= 74 and pos < MTF_CONFIRM_THRESHOLD:
-        parts.append("Action: Wait for additional timeframe confirmation, or look for BTD entry.")
-    else:
-        parts.append("Action: Monitor; no immediate entry recommended.")
-
+        parts.append("Flow signals quiet.")
+    mtf = d.get("mtf_details",{})
+    pos = sum(1 for v in mtf.values() if isinstance(v,(int,float)) and v>=MTF_POSITIVE_PRICE_SCORE)
+    parts.append(f"MTF positive count: {pos}")
+    if d.get("btd"):
+        parts.append(f"Buy-the-dip detected (pullback {d.get('btd_pullback')}%).")
     return " ".join(parts)
 
-# ----------------------------
-# Top-level analyze (returns dict)
-# ----------------------------
+# -------------------------
+# Core analyze function
+# -------------------------
 def analyze_ticker_full(ticker, include_options=True):
-    out = {"ticker": ticker, "error": None}
+    out = {"ticker":ticker, "error":None}
     try:
-        # daily history
         daily = safe_history(ticker, "1d", f"{HIST_DAYS}d")
-
         tech_daily = compute_technical_metrics(daily)
-        opt = compute_options_metrics(ticker) if include_options else {"opt_expiry": None, "call_put_vol_ratio": np.nan, "call_put_oi_ratio": np.nan}
-        price_score = score_price_momentum(tech_daily)
-        flow_score = score_volume_flow(tech_daily, opt)
-        inst_score = inst_flow_proxy(tech_daily, opt)
-
-        # weighting: use simple weights + inst_flow
+        opt = compute_options_metrics(ticker) if include_options else {"opt_expiry":None,"call_put_vol_ratio":np.nan,"call_put_oi_ratio":np.nan}
+        price_sc = score_price_momentum(tech_daily)
+        flow_sc = score_volume_flow(tech_daily,opt)
+        inst_sc = inst_flow_proxy(tech_daily,opt)
         p_w = SCORES_CONFIG["STOCK"]["price"]
         f_w = SCORES_CONFIG["STOCK"]["flow"]
         inst_w = INST_FLOW_WEIGHT
-        final = price_score * p_w + flow_score * f_w + inst_score * inst_w
-
-        # mtf
+        final = price_sc * p_w + flow_sc * f_w + inst_sc * inst_w
         mtf_count, mtf_confirm, mtf_details = compute_mtf_scores(ticker)
-
-        # btd
         btd_flag, btd_pull, btd_high = detect_buy_the_dip(daily)
-
         out.update({
             "last_close": tech_daily.get("last_close"),
-            "price_score": round(price_score,2),
-            "flow_score": round(flow_score,2),
-            "inst_score": round(inst_score,2),
+            "price_score": round(price_sc,2),
+            "flow_score": round(flow_sc,2),
+            "inst_score": round(inst_sc,2),
             "final_score": round(final,2),
             "signal": get_buy_signal(final),
             "mtf_count": mtf_count,
@@ -420,53 +373,129 @@ def analyze_ticker_full(ticker, include_options=True):
             "opt_call_put_oi_ratio": opt.get("call_put_oi_ratio"),
             "error": None
         })
-
     except Exception as e:
         out["error"] = str(e)
     return out
 
-# ----------------------------
-# UI: layout & interactions
-# ----------------------------
-st.set_page_config(page_title="Advanced Readiness Scanner (All-in-one)", layout="wide")
-st.title("📈 Advanced Readiness Scanner — Charts, MTF, AI Commentary & History")
+# -------------------------
+# UI: styling (Bloomberg look)
+# -------------------------
+BGC = "#0b1020"        # deep navy black
+CARD = "#0f1724"       # slightly lighter card
+NEON_GREEN = "#00ff7f" # bullish
+AMBER = "#ffb84d"      # neutral/borderline
+DANGER = "#ff4d4d"     # bearish
+TEXT = "#e6eef5"
 
-# Sidebar controls
-st.sidebar.header("Controls")
-ticker_input = st.sidebar.text_area("Tickers (comma separated)", value="AAPL, NVDA, MSFT")
-mode = st.sidebar.selectbox("Mode", ["Single/Manual", "Prebuilt Group"])
-group_choice = st.sidebar.selectbox("Group (when using group mode)", ["DOW30","NAS100_SAMPLE","CRYPTO_SAMPLE","FOREX_SAMPLE"])
-include_options = st.sidebar.checkbox("Include options metrics", True)
-workers = st.sidebar.slider("Parallel workers", min_value=1, max_value=12, value=min(MAX_WORKERS,8))
-run_btn = st.sidebar.button("Run Scan")
+st.set_page_config(page_title="Readiness Scanner — Bloomberg UI", layout="wide")
+# inject CSS to tighten visuals & apply dark theme
+st.markdown(f"""
+    <style>
+    :root {{
+        --bg: {BGC};
+        --card: {CARD};
+        --neon: {NEON_GREEN};
+        --amber: {AMBER};
+        --danger: {DANGER};
+        --text: {TEXT};
+    }}
+    .stApp {{
+        background: linear-gradient(180deg, #07101a 0%, #0b1020 100%);
+        color: var(--text);
+    }}
+    .card {{
+        background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(0,0,0,0.03));
+        border-radius: 8px;
+        padding: 14px;
+        margin: 8px 0;
+        box-shadow: 0 6px 18px rgba(0,0,0,0.6);
+        border: 1px solid rgba(255,255,255,0.03);
+    }}
+    .small-muted {{
+        color: #9fb0c8;
+        font-size:12px;
+    }}
+    .signal-pill {{
+        padding:6px 10px;
+        border-radius:999px;
+        font-weight:700;
+        color:#001411;
+    }}
+    .sig-strong {{ background: linear-gradient(90deg, #a7ffbf, #00ff7f); color:#04220d; }}
+    .sig-buy {{ background: linear-gradient(90deg, #7fffd4, #00cc66); color:#03170f; }}
+    .sig-watch {{ background: linear-gradient(90deg, #ffdca8, #ffb84d); color:#2f1a00; }}
+    .sig-none {{ background: linear-gradient(90deg, #ff9b9b, #ff4d4d); color:#2a0505; }}
+    .metric-card {{"background": "transparent"}}
+    .ticker-list-item:hover {{ background: rgba(255,255,255,0.02); }}
+    </style>
+""", unsafe_allow_html=True)
 
-# groups
-GROUPS = {
-    "DOW30": ["AAPL","AMGN","AXP","BA","CAT","CRM","CSCO","CVX","DIS","DOW","GS","HD","HON","IBM","INTC","JNJ","JPM","KO","MCD","MMM","MRK","MSFT","NKE","PG","TRV","UNH","V","VZ","WBA","WMT"],
-    "NAS100_SAMPLE": ["AAPL","MSFT","NVDA","TSLA","AMZN","META","GOOGL","ADBE"],
-    "CRYPTO_SAMPLE": ["BTC-USD","ETH-USD","SOL-USD","ADA-USD"],
-    "FOREX_SAMPLE": ["EURUSD=X","GBPUSD=X","USDJPY=X","USDCAD=X"]
-}
+# -------------------------
+# Sidebar controls + scheduler
+# -------------------------
+st.sidebar.markdown("<div style='padding:8px;background:transparent'><h3 style='color:var(--text)'>Scanner Controls</h3></div>", unsafe_allow_html=True)
+mode = st.sidebar.selectbox("Mode", ["Manual tickers", "Prebuilt group"])
+if mode == "Manual tickers":
+    raw = st.sidebar.text_area("Tickers (comma separated)", value="AAPL, NVDA, MSFT, TSLA")
+    tickers = [t.strip().upper() for t in raw.split(",") if t.strip()]
+else:
+    grp = st.sidebar.selectbox("Group", ["DOW30","NASDAQ_SAMPLE","CRYPTO_SAMPLE","FOREX_SAMPLE"])
+    GROUPS = {
+        "DOW30": ["AAPL","MSFT","JPM","GS","CVX","CAT","MMM","V","DIS","KO","WMT"],
+        "NASDAQ_SAMPLE": ["AAPL","MSFT","NVDA","TSLA","AMZN","META","ADBE"],
+        "CRYPTO_SAMPLE": ["BTC-USD","ETH-USD","SOL-USD","ADA-USD"],
+        "FOREX_SAMPLE": ["EURUSD=X","GBPUSD=X","USDJPY=X","USDCAD=X"]
+    }
+    tickers = GROUPS.get(grp, [])
 
-# Results storage in session
-if "scan_results" not in st.session_state:
-    st.session_state.scan_results = []
+include_options = st.sidebar.checkbox("Include options metrics", value=True)
+workers = st.sidebar.slider("Parallel workers", min_value=1, max_value=12, value=min(MAX_WORKERS,6))
+run_now = st.sidebar.button("▶️ Run Now")
 
-if run_btn:
-    st.session_state.scan_results = []
-    if mode == "Single/Manual":
-        tickers = [t.strip().upper() for t in ticker_input.split(",") if t.strip()]
-    else:
-        tickers = GROUPS.get(group_choice, [])
-    if not tickers:
-        st.warning("No tickers provided.")
-    else:
-        st.info(f"Starting scan for {len(tickers)} tickers...")
-        progress = st.progress(0)
-        results = []
-        total = len(tickers)
-        with ThreadPoolExecutor(max_workers=min(workers, total)) as ex:
-            futures = {ex.submit(analyze_ticker_full, t, include_options): t for t in tickers}
+st.sidebar.markdown("---")
+st.sidebar.markdown("<div style='color:var(--text)'>Auto-scan (runs when page is opened & interval reached)</div>", unsafe_allow_html=True)
+auto_scan = st.sidebar.checkbox("Enable Auto-scan", value=False)
+col1, col2 = st.sidebar.columns([2,1])
+with col1:
+    interval_min = st.number_input("Interval (minutes)", min_value=5, max_value=1440, value=60, step=5)
+with col2:
+    start_on_load = st.checkbox("Run on load", value=True)
+
+# initialize scheduler state
+if "last_auto_scan" not in st.session_state:
+    st.session_state.last_auto_scan = None
+if "next_auto_scan" not in st.session_state:
+    st.session_state.next_auto_scan = None
+
+# determine if auto-scan should run now (synchronous)
+def due_for_auto_run():
+    if not auto_scan:
+        return False
+    now = datetime.utcnow()
+    last = st.session_state.get("last_auto_scan")
+    if last is None:
+        # if user wants run on load -> treat as due
+        return start_on_load
+    try:
+        last_dt = datetime.fromisoformat(last)
+    except Exception:
+        last_dt = None
+    if last_dt is None:
+        return start_on_load
+    next_dt = last_dt + timedelta(minutes=int(interval_min))
+    st.session_state.next_auto_scan = next_dt.isoformat()
+    return now >= next_dt
+
+# run scanning function (synchronous, updates session_state)
+def run_scan(tickers_list):
+    results = []
+    total = len(tickers_list) if tickers_list else 0
+    if total == 0:
+        return results
+    with st.spinner(f"Scanning {total} tickers..."):
+        progress_bar = st.progress(0)
+        with ThreadPoolExecutor(max_workers=min(workers,total)) as ex:
+            futures = {ex.submit(analyze_ticker_full, t, include_options): t for t in tickers_list}
             done = 0
             for fut in as_completed(futures):
                 t = futures[fut]
@@ -476,154 +505,193 @@ if run_btn:
                     r = {"ticker": t, "error": str(e)}
                 results.append(r)
                 done += 1
-                progress.progress(done/total)
-        st.session_state.scan_results = results
-        # persist to sqlite
-        for r in results:
-            try:
-                persist_scan(r.get("ticker"), r.get("final_score"), r.get("signal"), r.get("last_close"))
-            except:
-                pass
-        st.success("Scan complete!")
+                progress_bar.progress(done/total)
+    # persist to DB
+    for r in results:
+        try:
+            persist_scan(r.get("ticker"), r.get("final_score"), r.get("signal"), r.get("last_close"))
+        except:
+            pass
+    # update last_auto_scan
+    st.session_state.last_auto_scan = datetime.utcnow().isoformat()
+    st.session_state.next_auto_scan = (datetime.utcnow() + timedelta(minutes=int(interval_min))).isoformat()
+    st.success(f"Scan finished — {len(results)} tickers scanned.")
+    return results
 
-# Show Results summary
-st.header("Results Summary")
+# Trigger run_now or auto-run if due
+if run_now:
+    st.session_state.scan_results = run_scan(tickers)
+    # show results below (page will re-render)
+elif auto_scan and due_for_auto_run():
+    # run it now (synchronous)
+    st.session_state.scan_results = run_scan(tickers)
+
+# Ensure scan_results is present
+if "scan_results" not in st.session_state:
+    st.session_state.scan_results = []
+
+# top header with last/next auto-run
+with st.container():
+    left, mid, right = st.columns([1,4,1])
+    with left:
+        st.markdown(f"<div style='color:var(--text);padding:6px'>Last Auto: <b>{st.session_state.get('last_auto_scan') or 'Never'}</b></div>", unsafe_allow_html=True)
+    with mid:
+        st.markdown("<h2 style='margin:6px;color:var(--neon)'>READINESS SCANNER — LIVE</h2>", unsafe_allow_html=True)
+    with right:
+        st.markdown(f"<div style='color:#9fb0c8;padding:6px;text-align:right'>Next Auto: <b>{st.session_state.get('next_auto_scan') or '—'}</b></div>", unsafe_allow_html=True)
+
+# -------------------------
+# Results Summary Area
+# -------------------------
+st.markdown("<div class='card'>", unsafe_allow_html=True)
+st.markdown("<div style='display:flex;justify-content:space-between;align-items:center'>", unsafe_allow_html=True)
+st.markdown("<div style='font-size:18px;color:var(--text)'><b>Results Summary</b> <span style='color:#9fb0c8;font-size:12px'>&nbsp; (latest session)</span></div>", unsafe_allow_html=True)
+st.markdown("</div>", unsafe_allow_html=True)
+
 if not st.session_state.scan_results:
-    st.info("No scan results available. Run a scan from the sidebar.")
+    st.markdown("<div style='padding:18px;color:#9fb0c8'>No scan results — run a scan (Run Now) or enable Auto-scan.</div>", unsafe_allow_html=True)
 else:
     df = pd.json_normalize(st.session_state.scan_results)
-    # friendly column names
-    if "ticker" in df.columns:
-        df = df.rename(columns={"ticker":"Ticker"})
-    display_cols = ["Ticker","final_score","signal","price_score","flow_score","inst_score","mtf_count","mtf_confirm","btd","btd_pullback"]
-    existing = [c for c in display_cols if c in df.columns]
-    st.dataframe(df[existing].sort_values("final_score", ascending=False).reset_index(drop=True), use_container_width=True)
+    # ensure ticker column exists
+    if 'ticker' in df.columns and 'ticker' not in df.columns:
+        df = df.rename(columns={'ticker':'Ticker'})
+    # friendly display table
+    display_cols = [c for c in ["ticker","final_score","signal","price_score","flow_score","inst_score","mtf_count","mtf_confirm","btd","btd_pullback"] if c in df.columns]
+    df_display = df[display_cols].copy()
+    df_display = df_display.sort_values("final_score", ascending=False).reset_index(drop=True)
+    # color-coded row style using emojis + badges
+    def signal_badge(s):
+        if s == "STRONG BUY":
+            return f"<span class='signal-pill sig-strong'>{s}</span>"
+        if s == "BUY":
+            return f"<span class='signal-pill sig-buy'>{s}</span>"
+        if s == "WATCHLIST":
+            return f"<span class='signal-pill sig-watch'>{s}</span>"
+        return f"<span class='signal-pill sig-none'>{s}</span>"
+    # display as Streamlit table with HTML in columns (use st.write for safer output)
+    # Build a compact card grid for top 6
+    top_n = df_display.head(6)
+    cards = st.columns(6)
+    for i, (_, row) in enumerate(top_n.iterrows()):
+        sig_html = signal_badge(row.get("signal","N/A"))
+        score = row.get("final_score","N/A")
+        tck = row.get("ticker","")
+        with cards[i]:
+            st.markdown(f"""
+                <div style='background:{CARD};padding:10px;border-radius:8px;min-height:110px'>
+                    <div style='font-size:14px;color:#9fb0c8'>{tck}</div>
+                    <div style='font-size:22px;color:var(--neon);font-weight:700;margin-top:6px'>{score}</div>
+                    <div style='margin-top:8px'>{sig_html}</div>
+                </div>
+            """, unsafe_allow_html=True)
+    st.markdown("---")
+    # full dataframe
+    st.dataframe(df_display.style.format({"final_score":"{:.2f}"}), use_container_width=True)
+st.markdown("</div>", unsafe_allow_html=True)
 
-    # mini top cards
-    top3 = df.sort_values("final_score", ascending=False).head(3)
-    cols = st.columns(3)
-    for i, (_, row) in enumerate(top3.iterrows()):
-        cols[i].metric(label=row.get("ticker") or row.get("Ticker"), value=row.get("final_score"), delta=row.get("signal"))
+# -------------------------
+# Detail viewer / Charts
+# -------------------------
+st.markdown("<div class='card' style='margin-top:12px'>", unsafe_allow_html=True)
+st.markdown("<h3 style='color:var(--text)'>Ticker Detail / Charts</h3>", unsafe_allow_html=True)
 
-    # Distribution
-    if "final_score" in df.columns:
-        fig = px.histogram(df, x="final_score", nbins=20, title="Score distribution")
-        st.plotly_chart(fig, use_container_width=True)
+detail_cols = st.columns([2,1])
+detail_choice = detail_cols[0].selectbox("Pick ticker to inspect", options=sorted({r.get("ticker") for r in st.session_state.scan_results}) if st.session_state.scan_results else tickers)
+if st.button("Refresh detail"):
+    pass
 
-    # allow user to choose ticker for detail
-    tickers_list = sorted([r.get("ticker") for r in st.session_state.scan_results])
-    sel = st.selectbox("Open Detail for ticker", options=tickers_list)
-    if st.button("Open Detail"):
-        st.session_state.detail_ticker = sel
-
-# Ticker Detail section
-detail_ticker = st.session_state.get("detail_ticker", None)
-st.header("Ticker Detail")
-if detail_ticker is None:
-    st.info("Open a ticker detail from the Results Summary or run a single ticker scan.")
-else:
-    st.subheader(f"Details — {detail_ticker}")
-    # recompute live single
-    single_res = analyze_ticker_full(detail_ticker, include_options=include_options)
-    if single_res.get("error"):
-        st.error("Error computing details: " + str(single_res.get("error")))
+if detail_choice:
+    detail_res = analyze_ticker_full(detail_choice, include_options=include_options)
+    if detail_res.get("error"):
+        st.error("Detail error: " + str(detail_res.get("error")))
     else:
-        # top metrics
-        c1, c2, c3 = st.columns([2,1,1])
-        c1.metric("Ticker", detail_ticker)
-        c2.metric("Score", single_res.get("final_score"))
-        c3.metric("Signal", single_res.get("signal"))
-
-        # AI commentary
-        commentary = ai_commentary({
-            "final_score": single_res.get("final_score"),
-            "price_score": single_res.get("price_score"),
-            "flow_score": single_res.get("flow_score"),
-            "inst_score": single_res.get("inst_score"),
-            "mtf_details": single_res.get("mtf_details"),
-            "btd": single_res.get("btd"),
-            "btd_pullback": single_res.get("btd_pullback")
-        })
-        st.markdown("**AI-style commentary (rule-based)**")
-        st.info(commentary)
-
-        # charts: daily candlestick + RSI + OBV
-        try:
-            histd = safe_history(detail_ticker, "1d", f"{HIST_DAYS}d")
-            if not histd.empty:
-                fig = go.Figure()
-                fig.add_trace(go.Candlestick(x=histd.index, open=histd["Open"], high=histd["High"], low=histd["Low"], close=histd["Close"], name="Price"))
-                fig.update_layout(title=f"{detail_ticker} — Daily", height=450, margin=dict(t=25))
-                st.plotly_chart(fig, use_container_width=True)
-
-                # RSI
-                r = rsi(histd["Close"])
-                fig2 = px.line(x=r.index, y=r.values, labels={"x":"Date","y":"RSI"}, title="RSI")
-                fig2.add_hline(y=70, line_dash="dash", line_color="red")
-                fig2.add_hline(y=30, line_dash="dash", line_color="green")
-                fig2.update_layout(height=250)
-                st.plotly_chart(fig2, use_container_width=True)
-
-                # OBV + volume
-                obv_series = obv(histd["Close"], histd["Volume"] if "Volume" in histd.columns else pd.Series([0]*len(histd), index=histd.index))
-                vol_fig = go.Figure()
-                vol_fig.add_trace(go.Bar(x=histd.index, y=histd["Volume"], name="Volume"))
-                vol_fig.add_trace(go.Scatter(x=obv_series.index, y=obv_series, name="OBV", yaxis="y2"))
-                vol_fig.update_layout(title="Volume & OBV", height=300, yaxis=dict(title="Volume"), yaxis2=dict(title="OBV", overlaying="y", side="right"))
-                st.plotly_chart(vol_fig, use_container_width=True)
-            else:
-                st.info("No daily history available for charts.")
-        except Exception as e:
-            st.info("Could not render charts: " + str(e))
-
-        # MTF breakdown
-        st.subheader("Multi-timeframe breakdown")
-        positives, confirmed, mtf_details = compute_mtf_scores(detail_ticker)
-        st.write("Positive count:", positives, "Confirmed across MTF:", confirmed)
-        st.write("MTF details:", mtf_details)
-
-        # Options snapshot
-        st.subheader("Options snapshot (nearest expiry)")
-        st.json({"expiry": single_res.get("opt_expiry"), "call_put_vol_ratio": single_res.get("opt_call_put_vol_ratio"), "call_put_oi_ratio": single_res.get("opt_call_put_oi_ratio")})
-
-        # Trend gauge (based on recent history in DB)
-        st.subheader("Trend gauge (based on persisted history)")
-        hist_df = read_history(detail_ticker, limit=200)
-        if not hist_df.empty:
-            hist_df["score"] = pd.to_numeric(hist_df["score"], errors="coerce")
-            recent = hist_df.head(30).sort_values("ts")
-            fig_hist = px.line(recent, x="ts", y="score", title=f"Recent scores for {detail_ticker}")
-            st.plotly_chart(fig_hist, use_container_width=True)
-            avg_score = recent["score"].mean()
-            st.metric("Average recent score", round(avg_score,2))
-            # simple gauge substitute (plotly doesn't have a native gauge in free version reliably)
-            gauge = go.Figure(go.Indicator(mode="gauge+number", value=single_res.get("final_score",0), gauge={'axis':{'range':[0,100]}}))
-            gauge.update_layout(height=250)
-            st.plotly_chart(gauge, use_container_width=True)
+        # top row metrics
+        a,b,c,d = st.columns([2,1,1,1])
+        a.metric("Ticker", detail_choice)
+        a.write("")  # spacer
+        b.metric("Readiness", detail_res.get("final_score"))
+        # colored signal pill
+        sig = detail_res.get("signal","N/A")
+        if sig == "STRONG BUY":
+            c.markdown(f"<div class='signal-pill sig-strong'>{sig}</div>", unsafe_allow_html=True)
+        elif sig == "BUY":
+            c.markdown(f"<div class='signal-pill sig-buy'>{sig}</div>", unsafe_allow_html=True)
+        elif sig == "WATCHLIST":
+            c.markdown(f"<div class='signal-pill sig-watch'>{sig}</div>", unsafe_allow_html=True)
         else:
-            st.info("No persisted history for this ticker yet.")
+            c.markdown(f"<div class='signal-pill sig-none'>{sig}</div>", unsafe_allow_html=True)
+        d.metric("MTF +", detail_res.get("mtf_count"))
 
-# History page: overall persisted scans
-st.header("Global Scan History (persisted)")
+        # charts
+        try:
+            histd = safe_history(detail_choice, "1d", f"{HIST_DAYS}d")
+            fig = go.Figure()
+            fig.add_trace(go.Candlestick(x=histd.index, open=histd["Open"], high=histd["High"], low=histd["Low"], close=histd["Close"], name="price"))
+            # add ema lines
+            try:
+                fig.add_trace(go.Scatter(x=histd.index, y=ema(histd["Close"], EMA_FAST), name=f"EMA{EMA_FAST}", line=dict(width=1, dash="dot", color="#7fffd4")))
+                fig.add_trace(go.Scatter(x=histd.index, y=ema(histd["Close"], EMA_SLOW), name=f"EMA{EMA_SLOW}", line=dict(width=1, dash="dot", color="#ffb84d")))
+            except:
+                pass
+            fig.update_layout(plot_bgcolor=BGC, paper_bgcolor=BGC, font_color=TEXT, height=420, margin=dict(t=20,b=20))
+            st.plotly_chart(fig, use_container_width=True)
+
+            # RSI
+            r = rsi(histd["Close"])
+            r_fig = px.line(x=r.index, y=r.values, labels={"x":"Date","y":"RSI"})
+            r_fig.update_layout(plot_bgcolor=BGC, paper_bgcolor=BGC, font_color=TEXT, height=200)
+            r_fig.add_hline(y=70, line_dash="dash", line_color="#ff4d4d")
+            r_fig.add_hline(y=30, line_dash="dash", line_color="#00ff7f")
+            st.plotly_chart(r_fig, use_container_width=True)
+
+            # volume + obv
+            vol = histd["Volume"] if "Volume" in histd.columns else pd.Series([0]*len(histd), index=histd.index)
+            obv_series = obv(histd["Close"], vol)
+            vol_fig = go.Figure()
+            vol_fig.add_trace(go.Bar(x=histd.index, y=vol, name="Volume"))
+            vol_fig.add_trace(go.Scatter(x=obv_series.index, y=obv_series, name="OBV", yaxis="y2"))
+            vol_fig.update_layout(plot_bgcolor=BGC, paper_bgcolor=BGC, font_color=TEXT, height=260,
+                                  yaxis=dict(title="Volume"), yaxis2=dict(title="OBV", overlaying="y", side="right"))
+            st.plotly_chart(vol_fig, use_container_width=True)
+        except Exception as e:
+            st.info("Charts unavailable: " + str(e))
+
+        # options snapshot
+        st.markdown("**Options snapshot**")
+        st.json({
+            "expiry": detail_res.get("opt_expiry"),
+            "call_put_vol_ratio": detail_res.get("opt_call_put_vol_ratio"),
+            "call_put_oi_ratio": detail_res.get("opt_call_put_oi_ratio")
+        })
+
+        # MTF details & commentary
+        st.markdown("**Multi-timeframe breakdown**")
+        st.write(detail_res.get("mtf_details"))
+        st.markdown("**AI-style commentary (rule-based)**")
+        st.info(ai_commentary(detail_res))
+
+st.markdown("</div>", unsafe_allow_html=True)
+
+# -------------------------
+# Persisted History & export
+# -------------------------
+st.markdown("<div class='card' style='margin-top:14px'>", unsafe_allow_html=True)
+st.markdown("<h3 style='color:var(--text)'>Persisted History & Exports</h3>", unsafe_allow_html=True)
 hist_all = read_history(limit=500)
 if hist_all.empty:
-    st.info("No persisted history. Run some scans to populate.")
+    st.info("No persisted history yet.")
 else:
-    # latest per ticker
-    latest = hist_all.groupby("ticker").first().reset_index()
-    st.dataframe(latest.sort_values("score", ascending=False).reset_index(drop=True).head(100), use_container_width=True)
-    # top average
-    avg = hist_all.groupby("ticker")["score"].mean().reset_index().rename(columns={"score":"avg_score"}).sort_values("avg_score", ascending=False).head(20)
-    fig_avg = px.bar(avg, x="ticker", y="avg_score", title="Top tickers by average score (persisted history)")
-    st.plotly_chart(fig_avg, use_container_width=True)
+    st.dataframe(hist_all.head(200), use_container_width=True)
+    # aggregated
+    agg = hist_all.groupby("ticker")["score"].agg(["mean","count"]).reset_index().sort_values("mean", ascending=False).head(30)
+    st.plotly_chart(px.bar(agg, x="ticker", y="mean", title="Top average scores (persisted)"), use_container_width=True)
 
-# Export last session results
-st.header("Export / Download")
 if st.session_state.get("scan_results"):
-    export_df = pd.json_normalize(st.session_state["scan_results"])
-    st.download_button("Download latest results CSV", data=export_df.to_csv(index=False).encode("utf-8"), file_name="latest_scan.csv", mime="text/csv")
-else:
-    st.info("No session results to export.")
+    df_export = pd.json_normalize(st.session_state["scan_results"])
+    st.download_button("Download last session CSV", df_export.to_csv(index=False).encode("utf-8"), file_name="latest_scan.csv", mime="text/csv")
+st.markdown("</div>", unsafe_allow_html=True)
 
-st.sidebar.markdown("---")
-st.sidebar.write("Built: single-file app — charts, MTF, commentary, SQLite history")
+# -------------------------
+# Footer guidance
+# -------------------------
+st.markdown("<div style='padding:14px;color:#9fb0c8;font-size:12px'>Bloomberg-style theme. Auto-scan runs when page is opened and the scheduled interval has been reached. For continuous server-side scheduling, use Streamlit Cloud scheduled jobs or an external cron to call your endpoint.</div>", unsafe_allow_html=True)
