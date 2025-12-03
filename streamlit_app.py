@@ -376,6 +376,7 @@ else:
     GROUPS = {
         "CRYPTO": ["BTC-USD","ETH-USD","SOL-USD","ADA-USD"],
         "FOREX": ["EURUSD=X","GBPUSD=X","USDJPY=X","USDCAD=X"],
+        "SECTORS": ["XLY", "IWM", "DIA", "SPY", "XLI", "QQQ", "XLK", "SMH", "XLRE", "XLE", "KRE", "DXY", "GDX", "XLP", "XLF", "XLU", "XLV",]
     }
     grp = st.sidebar.selectbox("Group", list(GROUPS.keys()))
     tickers = GROUPS[grp]
